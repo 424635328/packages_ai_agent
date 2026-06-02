@@ -894,6 +894,9 @@ static void send_working_status(const agent_msg_t* msg, int iteration)
     }
     if (strcmp(msg->channel, AGENT_CHAN_FEISHU) == 0
         || strcmp(msg->channel, AGENT_CHAN_VOICE) == 0
+#ifdef CONFIG_FEATURE_SYSTEM_VELACLAW
+        || strcmp(msg->channel, AGENT_CHAN_QUICKAPP) == 0
+#endif
         || strcmp(msg->channel, AGENT_CHAN_WEIXIN) == 0) {
         return;
     }
