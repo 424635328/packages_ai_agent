@@ -155,6 +155,120 @@ typedef struct {
 static conn_slot_t s_pool[CONN_POOL_SIZE];
 static pthread_mutex_t s_pool_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* ── TLS session cache (resumption) ──────────────────────────── */
+/* The connection pool above only helps while a socket stays open.  When the
+ * peer closes it -- which is the common case, measured 5 out of 5 requests on
+ * a BK7258 board on 2026-08-18 -- the next request pays a full handshake, and
+ * a full handshake on that part costs about 460 ms of pure computation
+ * (541 ms wall for DHE-2048, of which at most ~82 ms could have been network).
+ *
+ * That is 93% of a 582 ms HTTPS request, and it is avoidable: mbedTLS is
+ * already built here with MBEDTLS_SSL_SESSION_TICKETS and MBEDTLS_SSL_CACHE_C,
+ * so the code size has been paid for -- the calls were simply never made.
+ * Keeping the session per host and offering it on the next connection turns
+ * that handshake into a resumption, which is symmetric-only work.
+ *
+ * Cached by host:port because a session is only valid for the peer that issued
+ * it; offering it elsewhere would just be refused and cost a round trip. */
+
+#define SESS_CACHE_SIZE CONN_POOL_SIZE
+
+typedef struct {
+    mbedtls_ssl_session sess;
+    char host[128];
+    char port[8];
+    bool valid;
+} sess_slot_t;
+
+static sess_slot_t s_sess[SESS_CACHE_SIZE];
+static pthread_mutex_t s_sess_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Offer a stored session for host:port, if there is one.  Returns true when a
+ * session was offered.
+ *
+ * Whether the server actually accepted it is not reported: this mbedTLS has no
+ * public accessor for that (no mbedtls_ssl_get_handshake_resumed()), and
+ * guessing from internals would break on the next upgrade.  The observable
+ * effect is the handshake time, which is the quantity anyone would check
+ * anyway -- see the measurements referenced above. */
+static bool sess_offer(mbedtls_ssl_context* ssl, const char* host,
+    const char* port)
+{
+    bool offered = false;
+
+    pthread_mutex_lock(&s_sess_lock);
+    for (int i = 0; i < SESS_CACHE_SIZE; i++) {
+        if (s_sess[i].valid && strcmp(s_sess[i].host, host) == 0
+            && strcmp(s_sess[i].port, port) == 0) {
+            int ret = mbedtls_ssl_set_session(ssl, &s_sess[i].sess);
+            if (ret != 0) {
+                /* Stale or unusable: drop it rather than offering it again on
+                 * every future connection. */
+                mbedtls_ssl_session_free(&s_sess[i].sess);
+                s_sess[i].valid = false;
+                syslog(LOG_DEBUG,
+                    "[vela_tls] stored session for %s:%s rejected (-0x%04x), "
+                    "discarded\n", host, port, -ret);
+            } else {
+                offered = true;
+            }
+            break;
+        }
+    }
+    pthread_mutex_unlock(&s_sess_lock);
+    return offered;
+}
+
+/* Keep the session this handshake produced, replacing any older one. */
+static void sess_keep(mbedtls_ssl_context* ssl, const char* host,
+    const char* port)
+{
+    int slot = -1;
+
+    pthread_mutex_lock(&s_sess_lock);
+
+    for (int i = 0; i < SESS_CACHE_SIZE; i++) {
+        if (s_sess[i].valid && strcmp(s_sess[i].host, host) == 0
+            && strcmp(s_sess[i].port, port) == 0) {
+            slot = i;
+            mbedtls_ssl_session_free(&s_sess[i].sess);
+            s_sess[i].valid = false;
+            break;
+        }
+    }
+
+    if (slot < 0) {
+        for (int i = 0; i < SESS_CACHE_SIZE; i++) {
+            if (!s_sess[i].valid) {
+                slot = i;
+                break;
+            }
+        }
+    }
+
+    if (slot < 0) {
+        /* Evict slot 0: with one slot per pooled connection this only happens
+         * when more hosts are in use than the pool can hold, and the oldest is
+         * the least likely to be wanted next. */
+        slot = 0;
+        mbedtls_ssl_session_free(&s_sess[0].sess);
+        s_sess[0].valid = false;
+    }
+
+    mbedtls_ssl_session_init(&s_sess[slot].sess);
+    if (mbedtls_ssl_get_session(ssl, &s_sess[slot].sess) == 0) {
+        strncpy(s_sess[slot].host, host, sizeof(s_sess[slot].host) - 1);
+        s_sess[slot].host[sizeof(s_sess[slot].host) - 1] = '\0';
+        strncpy(s_sess[slot].port, port, sizeof(s_sess[slot].port) - 1);
+        s_sess[slot].port[sizeof(s_sess[slot].port) - 1] = '\0';
+        s_sess[slot].valid = true;
+    } else {
+        mbedtls_ssl_session_free(&s_sess[slot].sess);
+    }
+
+    pthread_mutex_unlock(&s_sess_lock);
+}
+
 /* Acquire a slot for host:port.  Returns a locked, connected ctx or NULL. */
 static conn_slot_t* pool_acquire(const char* host, const char* port)
 {
@@ -213,6 +327,15 @@ static void pool_release(conn_slot_t* s, const char* host, const char* port, boo
 
 void vela_tls_pool_cleanup(void)
 {
+    pthread_mutex_lock(&s_sess_lock);
+    for (int i = 0; i < SESS_CACHE_SIZE; i++) {
+        if (s_sess[i].valid) {
+            mbedtls_ssl_session_free(&s_sess[i].sess);
+            s_sess[i].valid = false;
+        }
+    }
+    pthread_mutex_unlock(&s_sess_lock);
+
     pthread_mutex_lock(&s_pool_lock);
     for (int i = 0; i < CONN_POOL_SIZE; i++) {
         if (s_pool[i].in_use) {
@@ -352,6 +475,20 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
     mbedtls_ssl_conf_authmode(&ctx->cfg, MBEDTLS_SSL_VERIFY_OPTIONAL);
     mbedtls_ssl_conf_rng(&ctx->cfg, mbedtls_ctr_drbg_random, &ctx->ctr_drbg);
 
+#if defined(MBEDTLS_SSL_SESSION_TICKETS)
+    /* Accept session tickets, so the session cache below has something to
+     * store for servers that use them instead of session IDs. */
+    mbedtls_ssl_conf_session_tickets(&ctx->cfg,
+        MBEDTLS_SSL_SESSION_TICKETS_ENABLED);
+#endif
+
+#if defined(MBEDTLS_DHM_C)
+    /* mbedTLS defaults this to 1024 bits, which is both weak and -- on a part
+     * with no big-number acceleration -- the slowest key exchange on offer.
+     * Anything below 2048 is refused rather than accepted slowly. */
+    mbedtls_ssl_conf_dhm_min_bitlen(&ctx->cfg, 2048);
+#endif
+
     /* Read timeout is handled at the socket level via SO_RCVTIMEO,
      * not via mbedtls_ssl_conf_read_timeout + mbedtls_net_recv_timeout,
      * because select()/poll() inside mbedtls_net_recv_timeout fails on
@@ -372,6 +509,9 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
     mbedtls_ssl_set_bio(&ctx->ssl, &ctx->net,
         mbedtls_net_send, mbedtls_net_recv, NULL);
 
+    /* Offer a previous session for this host, if we kept one. */
+    bool offered = sess_offer(&ctx->ssl, host, port);
+
     /* Handshake */
     while ((ret = mbedtls_ssl_handshake(&ctx->ssl)) != 0) {
         if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
@@ -390,8 +530,14 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
         }
     }
 
-    syslog(LOG_INFO, "[%s] Handshake OK: %s / %s\n", TAG, mbedtls_ssl_get_version(&ctx->ssl),
-        mbedtls_ssl_get_ciphersuite(&ctx->ssl));
+    syslog(LOG_INFO, "[%s] Handshake OK: %s / %s%s\n", TAG,
+        mbedtls_ssl_get_version(&ctx->ssl),
+        mbedtls_ssl_get_ciphersuite(&ctx->ssl),
+        offered ? " (stored session offered)" : "");
+
+    /* Keep it for next time.  This is the whole point: without it every new
+     * socket to the same host repeats ~460 ms of asymmetric work. */
+    sess_keep(&ctx->ssl, host, port);
 
     return 0;
 }
@@ -607,6 +753,22 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
     size_t copy = initial < resp_cap - 1 ? initial : resp_cap - 1;
     memcpy(resp_buf, body_start, copy);
     resp_pos = copy;
+
+    /* A response with neither Content-Length nor chunked encoding is, per
+     * HTTP/1.1, terminated by the connection closing -- so it cannot be
+     * reused, and waiting for it with the LLM read timeout (120 s) means a
+     * server that does not close leaves the caller stuck for two minutes.
+     * Shorten the wait for that case only, and do not put the connection back
+     * in the pool. */
+    if (content_length < 0 && !chunked) {
+        if (out_keep_alive)
+            *out_keep_alive = false;
+        if (ctx->net.fd >= 0) {
+            struct timeval tv_short = { .tv_sec = 5, .tv_usec = 0 };
+            setsockopt(ctx->net.fd, SOL_SOCKET, SO_RCVTIMEO,
+                &tv_short, sizeof(tv_short));
+        }
+    }
 
     /* Keep reading body */
     if (!eof) {
