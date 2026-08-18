@@ -112,6 +112,19 @@ int llm_proxy_init(void)
     if (AGENT_SECRET_MODEL[0])
         strncpy(s_model, AGENT_SECRET_MODEL, sizeof(s_model) - 1);
 
+    /* Endpoint from build-time secrets too.  Without this the key and model
+     * can be compiled in but the host cannot, because AGENT_LLM_API_HOST is
+     * an unconditional #define that agent_secrets.h cannot override -- so a
+     * board configured entirely at build time still had nowhere to send the
+     * request, and the only way to set a host was set_llm at runtime, which
+     * is lost with /mnt on every power cycle.
+     */
+
+    if (AGENT_SECRET_LLM_HOST[0])
+        strncpy(s_llm_host, AGENT_SECRET_LLM_HOST, sizeof(s_llm_host) - 1);
+    if (AGENT_SECRET_LLM_PATH[0])
+        strncpy(s_llm_path, AGENT_SECRET_LLM_PATH, sizeof(s_llm_path) - 1);
+
     char tmp[128] = { 0 };
     if (claw_config_get(AGENT_CFG_KEY_API_KEY, tmp, sizeof(tmp)) == OK && tmp[0])
         strncpy(s_api_key, tmp, sizeof(s_api_key) - 1);
@@ -783,11 +796,19 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
 
     cJSON* root = cJSON_Parse(rb.data);
 
-    resp_buf_free(&rb);
     if (!root) {
-        syslog(LOG_ERR, "[%s] Failed to parse API JSON\n", TAG);
+        /* Print what actually arrived.  "Failed to parse" on its own cannot
+         * distinguish a truncated body from an error page from a body that is
+         * fine but not JSON, and each of those has a different fix.
+         */
+
+        syslog(LOG_ERR, "[%s] Failed to parse API JSON, %zu bytes: %.200s\n",
+            TAG, rb.len, rb.data ? rb.data : "(null)");
+        resp_buf_free(&rb);
         return ERROR;
     }
+
+    resp_buf_free(&rb);
 
     /* Extract from OpenAI response */
     cJSON* choices = cJSON_GetObjectItem(root, "choices");

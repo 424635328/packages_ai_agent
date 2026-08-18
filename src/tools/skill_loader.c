@@ -24,6 +24,7 @@
 #include "tools/tool_registry.h"
 #include "agent_config.h"
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 #include <dirent.h>
@@ -445,6 +446,6 @@ void skill_loader_refresh(void)
     s_last_skill_hash = compute_skills_hash();
     /* Invalidate tool registry so next get_tools_json rebuilds */
     tool_registry_invalidate();
-    syslog(LOG_INFO, "[%s] Skills refreshed (hash=%08x)\n",
+    syslog(LOG_INFO, "[%s] Skills refreshed (hash=%08" PRIx32 ")\n",
         TAG, s_last_skill_hash);
 }

@@ -31,6 +31,8 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -71,6 +73,140 @@ static const char *TAG = "camera";
 #define CAM_DEFAULT_PROMPT \
     "Describe what you see in this image in detail. " \
     "If there is text, read it. If there are objects, identify them."
+
+/* ── Format negotiation ──────────────────────────────────── */
+
+/**
+ * Try one (geometry, pixel format) pair.
+ *
+ * @return OK if the driver accepted it, ERROR otherwise.
+ */
+static int camera_try_format(int fd, int width, int height,
+                             uint32_t pixelformat)
+{
+    struct v4l2_format fmt;
+
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width       = width;
+    fmt.fmt.pix.height      = height;
+    fmt.fmt.pix.pixelformat = pixelformat;
+    fmt.fmt.pix.sizeimage   = CAM_BUF_SIZE;
+    fmt.fmt.pix.field       = V4L2_FIELD_NONE;
+
+    return ioctl(fd, VIDIOC_S_FMT, (uintptr_t)&fmt) < 0 ? ERROR : OK;
+}
+
+/**
+ * Pick the discrete frame size this device enumerates for pixelformat whose
+ * pixel count is closest to the requested one.
+ *
+ * Needed because the geometries this tool asks for are not universal: a
+ * driver enumerates the modes it carries register tables for and rejects
+ * everything else, and VIDIOC_S_FMT is then the wrong place to learn what
+ * would have been accepted.  Two examples from boards this tool runs on:
+ * the BES AON camera takes 320x180 and 1280x720, while the BK7258 GC2145
+ * path programs 480x480 / 640x480 / 864x480 and matches exactly.
+ *
+ * @return OK and updates width/height when a size was found.
+ */
+static int camera_pick_enumerated_size(int fd, uint32_t pixelformat,
+                                       int *width, int *height)
+{
+    unsigned long want = (unsigned long)(*width) * (unsigned long)(*height);
+    unsigned long best_delta = ULONG_MAX;
+    int best_w = 0;
+    int best_h = 0;
+    int i;
+
+    for (i = 0; ; i++) {
+        struct v4l2_frmsizeenum frmsize;
+        unsigned long area;
+        unsigned long delta;
+
+        memset(&frmsize, 0, sizeof(frmsize));
+        frmsize.index        = i;
+        frmsize.pixel_format = pixelformat;
+        frmsize.buf_type     = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+        if (ioctl(fd, VIDIOC_ENUM_FRAMESIZES, (uintptr_t)&frmsize) < 0) {
+            break;
+        }
+
+        if (frmsize.type != V4L2_FRMSIZE_TYPE_DISCRETE) {
+            continue;
+        }
+
+        area  = (unsigned long)frmsize.discrete.width *
+                (unsigned long)frmsize.discrete.height;
+        delta = area > want ? area - want : want - area;
+
+        if (delta < best_delta) {
+            best_delta = delta;
+            best_w = (int)frmsize.discrete.width;
+            best_h = (int)frmsize.discrete.height;
+        }
+    }
+
+    if (best_w == 0) {
+        return ERROR;
+    }
+
+    *width  = best_w;
+    *height = best_h;
+    return OK;
+}
+
+/**
+ * Set the capture format, negotiating the geometry if the requested one is
+ * refused.
+ *
+ * Order: the requested geometry in JPEG, then in ENTROPY (BES hardware
+ * JPEG), then an enumerated geometry in each.  The requested geometry is
+ * still tried first, so a device that supports it behaves exactly as before.
+ *
+ * @param width   In: requested width.  Out: the width actually set.
+ * @param height  Likewise for height.
+ */
+static int camera_set_format(int fd, int *width, int *height)
+{
+    static const uint32_t candidates[] = {
+        V4L2_PIX_FMT_JPEG,
+        V4L2_PIX_FMT_ENTROPY,
+    };
+
+    size_t i;
+
+    for (i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        if (camera_try_format(fd, *width, *height, candidates[i]) == OK) {
+            return OK;
+        }
+    }
+
+    for (i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        int w = *width;
+        int h = *height;
+
+        if (camera_pick_enumerated_size(fd, candidates[i], &w, &h) != OK) {
+            continue;
+        }
+
+        if (w == *width && h == *height) {
+            continue;  /* Already tried above. */
+        }
+
+        if (camera_try_format(fd, w, h, candidates[i]) == OK) {
+            syslog(LOG_INFO,
+                   "[%s] %dx%d refused, using enumerated %dx%d\n",
+                   TAG, *width, *height, w, h);
+            *width  = w;
+            *height = h;
+            return OK;
+        }
+    }
+
+    return ERROR;
+}
 
 /* ── V4L2 capture helper ─────────────────────────────────── */
 
@@ -116,23 +252,12 @@ static int camera_v4l2_capture(int width, int height,
         goto cleanup;
     }
 
-    /* Set format: hardware JPEG encoder */
-    struct v4l2_format fmt;
-    memset(&fmt, 0, sizeof(fmt));
-    fmt.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    fmt.fmt.pix.width       = width;
-    fmt.fmt.pix.height      = height;
-    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_JPEG;
-    fmt.fmt.pix.sizeimage   = CAM_BUF_SIZE;
-    fmt.fmt.pix.field       = V4L2_FIELD_NONE;
-
-    if (ioctl(fd, VIDIOC_S_FMT, (uintptr_t)&fmt) < 0) {
-        /* Fallback: try V4L2_PIX_FMT_ENTROPY (BES hardware JPEG) */
-        fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_ENTROPY;
-        if (ioctl(fd, VIDIOC_S_FMT, (uintptr_t)&fmt) < 0) {
-            syslog(LOG_ERR, "[%s] VIDIOC_S_FMT failed: %d\n", TAG, errno);
-            goto cleanup;
-        }
+    /* Set format: hardware JPEG encoder.  Negotiates the geometry when the
+     * driver refuses the requested one (see camera_set_format).
+     */
+    if (camera_set_format(fd, &width, &height) != OK) {
+        syslog(LOG_ERR, "[%s] VIDIOC_S_FMT failed: %d\n", TAG, errno);
+        goto cleanup;
     }
 
     syslog(LOG_INFO, "[%s] Format set: %dx%d\n", TAG, width, height);
@@ -160,7 +285,7 @@ static int camera_v4l2_capture(int width, int height,
         buf.index  = i;
 
         if (ioctl(fd, VIDIOC_QUERYBUF, (uintptr_t)&buf) < 0) {
-            syslog(LOG_ERR, "[%s] VIDIOC_QUERYBUF %u failed\n", TAG, i);
+            syslog(LOG_ERR, "[%s] VIDIOC_QUERYBUF %" PRIu32 " failed\n", TAG, i);
             goto cleanup;
         }
 
@@ -169,7 +294,7 @@ static int camera_v4l2_capture(int width, int height,
                           MAP_SHARED, fd, buf.m.offset);
         if (buffers[i] == MAP_FAILED) {
             buffers[i] = NULL;
-            syslog(LOG_ERR, "[%s] mmap buffer %u failed\n", TAG, i);
+            syslog(LOG_ERR, "[%s] mmap buffer %" PRIu32 " failed\n", TAG, i);
             goto cleanup;
         }
     }
@@ -183,7 +308,7 @@ static int camera_v4l2_capture(int width, int height,
         buf.index  = i;
 
         if (ioctl(fd, VIDIOC_QBUF, (uintptr_t)&buf) < 0) {
-            syslog(LOG_ERR, "[%s] VIDIOC_QBUF %u failed\n", TAG, i);
+            syslog(LOG_ERR, "[%s] VIDIOC_QBUF %" PRIu32 " failed\n", TAG, i);
             goto cleanup;
         }
     }
@@ -216,7 +341,7 @@ static int camera_v4l2_capture(int width, int height,
         goto cleanup;
     }
 
-    syslog(LOG_INFO, "[%s] Captured frame: %u bytes from buffer %u\n",
+    syslog(LOG_INFO, "[%s] Captured frame: %" PRIu32 " bytes from buffer %" PRIu32 "\n",
            TAG, dqbuf.bytesused, dqbuf.index);
 
     /* Copy JPEG data out (mmap buffer will be released) */
@@ -227,7 +352,7 @@ static int camera_v4l2_capture(int width, int height,
             *out_size = dqbuf.bytesused;
             ret = OK;
         } else {
-            syslog(LOG_ERR, "[%s] OOM copying frame (%u bytes)\n",
+            syslog(LOG_ERR, "[%s] OOM copying frame (%" PRIu32 " bytes)\n",
                    TAG, dqbuf.bytesused);
         }
     }

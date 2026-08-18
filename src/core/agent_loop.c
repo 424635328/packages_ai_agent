@@ -67,6 +67,37 @@ static bool llm_call_timed_out(uint32_t latency_ms);
 
 /* ── Clock-safe elapsed time calculation ───────────────────── */
 
+/****************************************************************************
+ * Name: agent_elapsed_mark
+ *
+ * Description:
+ *   Samples the clock the LLM watchdog measures with.  CLOCK_MONOTONIC, not
+ *   gettimeofday(): vela_tls.c pushes the wall clock from 1970 to 2026 during
+ *   the first TLS handshake ("Clock too old, forcing to 2026"), so a call that
+ *   straddles that jump measured ~2.7e9 ms and was declared timed out even
+ *   though the answer had arrived.  That made the first `ask` after every boot
+ *   fail, with the documented workaround being "run net_test first".
+ *
+ *   struct timeval is kept so calc_elapsed_ms() and its six call sites stay
+ *   unchanged; only the source of the numbers moves.
+ *
+ ****************************************************************************/
+
+static inline void agent_elapsed_mark(struct timeval* tv)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+        tv->tv_sec = ts.tv_sec;
+        tv->tv_usec = ts.tv_nsec / 1000;
+        return;
+    }
+
+    /* No monotonic clock: fall back rather than report a zero duration. */
+
+    gettimeofday(tv, NULL);
+}
+
 static inline uint32_t calc_elapsed_ms(const struct timeval* t0,
     const struct timeval* t1)
 {
@@ -659,10 +690,20 @@ static char* handle_slash_remind(const agent_msg_t* msg)
         (long long)(time(NULL) + secs), remind_msg,
         msg->channel, msg->chat_id);
 
-    char* reply = calloc(1, 512);
+    /* Sized from the message it has to quote back, not a round number.
+     *
+     * remind_msg is up to sizeof(remind_msg) - 1 bytes and the rest of the
+     * sentence is fixed, so a 512-byte buffer could truncate -- and the
+     * truncation would land mid-message, which for UTF-8 means cutting a
+     * multi-byte sequence in half and putting an invalid byte on the wire to
+     * the channel.  gcc flags this as -Wformat-truncation.
+     */
+
+    size_t replysz = sizeof(remind_msg) + 64;
+    char* reply = calloc(1, replysz);
     if (reply) {
-        tool_registry_execute("cron_add", input, reply, 512);
-        snprintf(reply, 512, "好的，%d 秒后提醒你：%s",
+        tool_registry_execute("cron_add", input, reply, replysz);
+        snprintf(reply, replysz, "好的，%d 秒后提醒你：%s",
             secs, remind_msg);
     }
     return reply;
@@ -820,9 +861,9 @@ static char* force_finish_reply(const char* system_prompt,
     llm_response_t resp;
     char* result = NULL;
     struct timeval t0, t1;
-    gettimeofday(&t0, NULL);
+    agent_elapsed_mark(&t0);
     int err = llm_chat_tools(system_prompt, messages, NULL, &resp);
-    gettimeofday(&t1, NULL);
+    agent_elapsed_mark(&t1);
     uint32_t ms = calc_elapsed_ms(&t0, &t1);
     bool timed_out = llm_call_timed_out(ms);
 
@@ -990,9 +1031,9 @@ static char* handle_task_complete(const char* sys_prompt, cJSON* messages,
     llm_response_t final_resp;
     char* result = NULL;
     struct timeval t0, t1;
-    gettimeofday(&t0, NULL);
+    agent_elapsed_mark(&t0);
     int err = llm_chat_tools(sys_prompt, messages, NULL, &final_resp);
-    gettimeofday(&t1, NULL);
+    agent_elapsed_mark(&t1);
     uint32_t ms = calc_elapsed_ms(&t0, &t1);
     bool timed_out = llm_call_timed_out(ms);
 
@@ -1065,9 +1106,9 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
 
         llm_response_t resp;
         struct timeval tv_start, tv_end;
-        gettimeofday(&tv_start, NULL);
+        agent_elapsed_mark(&tv_start);
         int err = llm_chat_tools(sys_prompt, messages, tools_json, &resp);
-        gettimeofday(&tv_end, NULL);
+        agent_elapsed_mark(&tv_end);
         uint32_t latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
 
         /* Router failover: on LLM call failure, try next backend */
@@ -1083,10 +1124,10 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                 router_idx = next_idx;
                 trace.backend_idx = next_idx;
                 llm_response_free(&resp);
-                gettimeofday(&tv_start, NULL);
+                agent_elapsed_mark(&tv_start);
                 err = llm_chat_tools(sys_prompt, messages,
                     tools_json, &resp);
-                gettimeofday(&tv_end, NULL);
+                agent_elapsed_mark(&tv_end);
                 latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
             }
         }
@@ -1183,10 +1224,10 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                     router_idx = prem_idx;
                     trace.backend_idx = prem_idx;
 
-                    gettimeofday(&tv_start, NULL);
+                    agent_elapsed_mark(&tv_start);
                     err = llm_chat_tools(sys_prompt, messages,
                         tools_json, &resp);
-                    gettimeofday(&tv_end, NULL);
+                    agent_elapsed_mark(&tv_end);
                     latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
 
                     /* Watchdog check on cascade retry */

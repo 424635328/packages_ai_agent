@@ -53,6 +53,12 @@
 #ifndef AGENT_SECRET_MODEL
 #define AGENT_SECRET_MODEL ""
 #endif
+#ifndef AGENT_SECRET_LLM_HOST
+#define AGENT_SECRET_LLM_HOST ""
+#endif
+#ifndef AGENT_SECRET_LLM_PATH
+#define AGENT_SECRET_LLM_PATH ""
+#endif
 #ifndef AGENT_SECRET_PROXY_HOST
 #define AGENT_SECRET_PROXY_HOST ""
 #endif
@@ -116,7 +122,9 @@
  * a timeout and replies with a user-friendly error message.
  * The socket-level SO_RCVTIMEO (AGENT_LLM_SOCKET_TIMEOUT_SEC)
  * acts as the hard backstop that actually unblocks the read. */
+#ifndef AGENT_LLM_TIMEOUT_SEC
 #define AGENT_LLM_TIMEOUT_SEC 60
+#endif
 
 /* Socket-level read timeout applied via SO_RCVTIMEO in vela_tls.
  * Must be >= AGENT_LLM_TIMEOUT_SEC to allow the agent-level
