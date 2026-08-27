@@ -393,11 +393,14 @@
 #define AGENT_VOICE_DEFAULT_CLUSTER "volcano_tts"
 
 /* WebSocket TTS output sample rate.  Big-model voices can produce 24kHz,
- * but the BK7258 DAC's only pitch-correct rates are 8k/16k/32k, and 24k
- * would also carry 50% more PCM through the same link and buffers.  Use
- * 16kHz so the request, the delivered PCM, the playback device and the
- * duration accounting all agree.  Override for hardware that can do
- * better. */
+ * but on BK7258 the DAC is clocked from the 26 MHz crystal (APLL is
+ * rejected with -ENOTSUP, see board/.../bk7258_aud.c aud_clk_config()),
+ * which cannot divide into 24kHz (26M/24k is not integral), so a 24k
+ * request would be played at a wrong pitch.  16k also cuts the PCM
+ * bandwidth by a third, which directly reduces playback underruns.
+ * Use 16kHz so the request, the delivered PCM, the playback device,
+ * and the duration accounting all agree.  Override for hardware that
+ * can do better. */
 #ifndef AGENT_TTS_WS_SAMPLE_RATE
 #define AGENT_TTS_WS_SAMPLE_RATE 16000
 #endif
