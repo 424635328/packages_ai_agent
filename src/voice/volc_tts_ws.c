@@ -499,7 +499,10 @@ static int send_tts_request(tts_tls_ctx_t* ctx, const char* text)
 
     cJSON_AddStringToObject(audio, "voice_type", s_speaker);
     cJSON_AddStringToObject(audio, "encoding", "pcm");
-    cJSON_AddNumberToObject(audio, "sample_rate", AGENT_TTS_WS_SAMPLE_RATE);
+    /* The ws_binary protocol names the receive sample rate "rate"; a
+     * "sample_rate" key is ignored, leaving the service's voice default
+     * (24kHz) in effect regardless of what this client asks for. */
+    cJSON_AddNumberToObject(audio, "rate", AGENT_TTS_WS_SAMPLE_RATE);
     cJSON_AddNumberToObject(audio, "speed_ratio", 1.0);
 
     /* request */
