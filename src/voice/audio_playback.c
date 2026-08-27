@@ -37,7 +37,9 @@ struct audio_playback {
     void* player;
     size_t total_written;
     int bytes_per_frame;
+    size_t preroll_bytes;   /* PCM buffered before the player starts */
     volatile int stopped;
+    int started;            /* media_player_start() not yet issued */
 };
 
 audio_playback_t* audio_playback_open(const char* dev_path,
@@ -73,13 +75,6 @@ audio_playback_t* audio_playback_open(const char* dev_path,
         return NULL;
     }
 
-    ret = media_player_start(player);
-    if (ret < 0) {
-        syslog(LOG_ERR, "[%s] start failed: %d\n", TAG, ret);
-        media_player_close(player, 0);
-        return NULL;
-    }
-
     audio_playback_t* pb = calloc(1, sizeof(*pb));
     if (!pb) {
         media_player_close(player, 0);
@@ -88,10 +83,18 @@ audio_playback_t* audio_playback_open(const char* dev_path,
 
     pb->player = player;
     pb->bytes_per_frame = (bits_per_sample / 8) * channels;
+    pb->preroll_bytes = (size_t)AGENT_TTS_PREROLL_MS *
+        (size_t)sample_rate * (size_t)pb->bytes_per_frame / 1000u;
     s_active_player = player;
 
-    syslog(LOG_INFO, "[%s] opened (%uHz %uch %ubit)\n",
-        TAG, sample_rate, channels, bits_per_sample);
+    /* Do not start yet: the first AGENT_TTS_PREROLL_MS of PCM is buffered
+     * before the player goes live (see audio_playback_write), so a jittery
+     * network cannot drain the queue and cause 'playback -> silence ->
+     * playback' underruns at the start of the sentence. */
+
+    syslog(LOG_INFO, "[%s] opened (%uHz %uch %ubit), "
+        "preroll=%zu bytes before start\n",
+        TAG, sample_rate, channels, bits_per_sample, pb->preroll_bytes);
     return pb;
 }
 
@@ -106,8 +109,33 @@ int audio_playback_write(audio_playback_t* pb, const void* buf, size_t len)
     }
 
     ssize_t n = media_player_write_data(pb->player, buf, len);
-    if (n > 0) {
-        pb->total_written += (size_t)n;
+    if (n <= 0) {
+        return (int)n;
+    }
+
+    pb->total_written += (size_t)n;
+
+    /* Preroll: hold off media_player_start until the first chunk(s) have
+     * filled AGENT_TTS_PREROLL_MS of PCM.  Unless this is done, the very
+     * first bytes are written while the server's queue is (nearly) empty;
+     * a network stall in the first 200ms of the sentence then drains the
+     * queue and the output goes 'silence -> gap -> continue'.  Once the
+     * threshold is crossed we start exactly once; the framework's own
+     * start_audio threshold (queue full) then aligns with real playback. */
+
+    if (!pb->started && pb->total_written >= pb->preroll_bytes) {
+        int ret = media_player_start(pb->player);
+        if (ret < 0) {
+            syslog(LOG_ERR, "[%s] start failed at preroll: %d\n", TAG, ret);
+            return ret;
+        }
+
+        pb->started = 1;
+        syslog(LOG_INFO, "[%s] player started after %zu bytes "
+            "(%.0f ms)\n", TAG, pb->total_written,
+            (double)pb->total_written * 1000.0 /
+            ((double)pb->bytes_per_frame *
+             (double)AGENT_TTS_WS_SAMPLE_RATE));
     }
 
     return (int)n;
@@ -133,8 +161,9 @@ void audio_playback_close(audio_playback_t* pb)
         unsigned int bpf = pb->bytes_per_frame ? pb->bytes_per_frame : 2;
         double secs = (double)pb->total_written /
                       ((double)bpf * (double)AGENT_TTS_WS_SAMPLE_RATE);
-        syslog(LOG_INFO, "[%s] closing (%zu bytes, %.2fs @ %u Hz)\n",
-            TAG, pb->total_written, secs, AGENT_TTS_WS_SAMPLE_RATE);
+        syslog(LOG_INFO, "[%s] closing (%zu bytes, %.2fs @ %u Hz%s)\n",
+            TAG, pb->total_written, secs, AGENT_TTS_WS_SAMPLE_RATE,
+            pb->started ? "" : ", never started (data < preroll)");
         media_player_stop(pb->player);
         usleep(50 * 1000);
         media_player_close(pb->player, 0);

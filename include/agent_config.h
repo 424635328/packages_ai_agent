@@ -405,6 +405,15 @@
 #define AGENT_TTS_WS_SAMPLE_RATE 16000
 #endif
 
+/* How much TTS PCM (in milliseconds) to buffer before the playback device
+ * starts consuming, guarding the start of a sentence against network
+ * jitter.  Too low lets the first chunk underrun; too high adds perceived
+ * latency to every reply.  200-300ms is a good balance for streaming TTS.
+ */
+#ifndef AGENT_TTS_PREROLL_MS
+#define AGENT_TTS_PREROLL_MS 250
+#endif
+
 /* ── Tool Guard (security) ──────────────────────────────────── */
 #define AGENT_TOOL_MAX_INPUT_LEN (32 * 1024)
 #define AGENT_TOOL_RATE_LIMIT_WINDOW_SEC 60
