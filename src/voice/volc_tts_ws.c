@@ -68,8 +68,6 @@ static const char* TAG = "volc_tts_ws";
 #define WS_OPCODE_PONG 0x0A
 #define WS_OPCODE_BINARY 0x02
 #define WS_OPCODE_CLOSE 0x08
-#define WS_OPCODE_PING 0x09
-#define WS_OPCODE_PONG 0x0A
 #define WS_FIN_BIT 0x80
 #define WS_MASK_BIT 0x80
 
