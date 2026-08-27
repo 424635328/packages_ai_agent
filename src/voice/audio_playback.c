@@ -130,8 +130,11 @@ void audio_playback_close(audio_playback_t* pb)
     }
 
     if (pb->player) {
-        syslog(LOG_INFO, "[%s] closing (%zu bytes written)\n",
-            TAG, pb->total_written);
+        unsigned int bpf = pb->bytes_per_frame ? pb->bytes_per_frame : 2;
+        double secs = (double)pb->total_written /
+                      ((double)bpf * (double)AGENT_TTS_WS_SAMPLE_RATE);
+        syslog(LOG_INFO, "[%s] closing (%zu bytes, %.2fs @ %u Hz)\n",
+            TAG, pb->total_written, secs, AGENT_TTS_WS_SAMPLE_RATE);
         media_player_stop(pb->player);
         usleep(50 * 1000);
         media_player_close(pb->player, 0);
