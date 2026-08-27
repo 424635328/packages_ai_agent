@@ -392,8 +392,15 @@
 #define AGENT_VOICE_DEFAULT_SPEAKER "zh_male_beijingxiaoye_emo_v2_mars_bigtts"
 #define AGENT_VOICE_DEFAULT_CLUSTER "volcano_tts"
 
-/* WebSocket TTS output sample rate (big-model voices output 24kHz) */
-#define AGENT_TTS_WS_SAMPLE_RATE 24000
+/* WebSocket TTS output sample rate.  Big-model voices can produce 24kHz,
+ * but the BK7258 DAC's only pitch-correct rates are 8k/16k/32k, and 24k
+ * would also carry 50% more PCM through the same link and buffers.  Use
+ * 16kHz so the request, the delivered PCM, the playback device and the
+ * duration accounting all agree.  Override for hardware that can do
+ * better. */
+#ifndef AGENT_TTS_WS_SAMPLE_RATE
+#define AGENT_TTS_WS_SAMPLE_RATE 16000
+#endif
 
 /* ── Tool Guard (security) ──────────────────────────────────── */
 #define AGENT_TOOL_MAX_INPUT_LEN (32 * 1024)
