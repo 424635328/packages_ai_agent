@@ -64,8 +64,12 @@ static const char* TAG = "volc_tts_ws";
 /* WebSocket constants */
 #define WS_BUF_SIZE (32 * 1024)
 #define WS_MASK_KEY_LEN 4
+#define WS_OPCODE_PING 0x09
+#define WS_OPCODE_PONG 0x0A
 #define WS_OPCODE_BINARY 0x02
 #define WS_OPCODE_CLOSE 0x08
+#define WS_OPCODE_PING 0x09
+#define WS_OPCODE_PONG 0x0A
 #define WS_FIN_BIT 0x80
 #define WS_MASK_BIT 0x80
 
@@ -311,13 +315,13 @@ static int ws_upgrade(tts_tls_ctx_t* ctx, const char* host, const char* path,
 
 /* ── WebSocket frame send (client must mask) ─────────────────── */
 
-static int ws_send_binary(tts_tls_ctx_t* ctx, const unsigned char* payload,
-    size_t plen)
+static int ws_send_frame(tts_tls_ctx_t* ctx, int opcode,
+    const unsigned char* payload, size_t plen)
 {
     unsigned char hdr[14];
     size_t hdr_len = 0;
 
-    hdr[0] = WS_FIN_BIT | WS_OPCODE_BINARY;
+    hdr[0] = WS_FIN_BIT | (unsigned char)opcode;
 
     if (plen < 126) {
         hdr[1] = WS_MASK_BIT | (unsigned char)plen;
@@ -372,6 +376,17 @@ static int ws_send_binary(tts_tls_ctx_t* ctx, const unsigned char* payload,
     }
 
     return 0;
+}
+
+/* Send a PONG echoing a received PING payload, keeping the connection
+ * alive across long synthesis.  Muted writes are not fatal; the caller's
+ * next recv timeout would surface a dead link anyway.
+ */
+
+static int ws_send_pong(tts_tls_ctx_t* ctx, const unsigned char* payload,
+    size_t plen)
+{
+    return ws_send_frame(ctx, WS_OPCODE_PONG, payload, plen);
 }
 
 /* ── WebSocket frame recv ────────────────────────────────────── */
@@ -466,7 +481,8 @@ static int send_volc_frame(tts_tls_ctx_t* ctx, unsigned char msg_type,
         memcpy(frame + VOLC_HDR_SIZE, payload, plen);
     }
 
-    int ret = ws_send_binary(ctx, frame, VOLC_HDR_SIZE + plen);
+    int ret = ws_send_frame(ctx, WS_OPCODE_BINARY,
+        frame, VOLC_HDR_SIZE + plen);
 
     free(frame);
     return ret;
@@ -599,6 +615,28 @@ static int recv_tts_audio(tts_tls_ctx_t* ctx, volc_tts_chunk_cb cb,
         if (opcode == WS_OPCODE_CLOSE) {
             syslog(LOG_INFO, "[%s] server closed WS\n", TAG);
             break;
+        }
+
+        /* Answer the server's WebSocket keepalive.  These frames carry
+         * their own opcode outside the Volcengine envelope and may be
+         * shorter than 4 bytes, so they are handled before the "too
+         * short" guard below.  The payload echoed by PONG is whatever
+         * the server sent in the PING (possibly empty). */
+
+        if (opcode == WS_OPCODE_PING) {
+            if (flen > WS_BUF_SIZE) {
+                flen = WS_BUF_SIZE;
+            }
+
+            if (ws_send_pong(ctx, buf, flen) != 0) {
+                syslog(LOG_WARNING, "[%s] PONG send failed\n", TAG);
+            }
+
+            continue;
+        }
+
+        if (opcode == WS_OPCODE_PONG) {
+            continue; /* nothing to do with a peer PONG */
         }
 
         if (flen < 4) {
