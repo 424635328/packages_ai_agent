@@ -644,19 +644,38 @@ static int recv_tts_audio(tts_tls_ctx_t* ctx, volc_tts_chunk_cb cb,
             }
 
             /* After volc header: 4-byte sequence (signed) + 4-byte payload_size */
-            size_t audio_off = volc_hdr_len + 8;
-
-            if (flen <= audio_off) {
+            if (flen < volc_hdr_len + 4) {
                 continue;
             }
 
             /* Extract sequence as signed 32-bit (big-endian).
-             * Per Volcengine binary protocol: sequence < 0 means last frame. */
+             * Per Volcengine binary protocol: sequence < 0 means last frame,
+             * and that frame may carry no payload at all.  Read the sequence
+             * before looking at payload size so the end marker is never
+             * dropped as a "too short" frame. */
             int32_t seq = (int32_t)(
                 ((uint32_t)buf[volc_hdr_len] << 24) |
                 ((uint32_t)buf[volc_hdr_len + 1] << 16) |
                 ((uint32_t)buf[volc_hdr_len + 2] << 8) |
                 (uint32_t)buf[volc_hdr_len + 3]);
+
+            /* sequence < 0 = last audio frame, may still hold final PCM */
+            if (seq < 0) {
+                size_t audio_off = volc_hdr_len + 8;
+
+                if (flen > audio_off) {
+                    cb(buf + audio_off, flen - audio_off, 0, user_data);
+                }
+
+                chunks++;
+                break;
+            }
+
+            size_t audio_off = volc_hdr_len + 8;
+
+            if (flen <= audio_off) {
+                continue;
+            }
 
             unsigned char* pcm = buf + audio_off;
             size_t pcm_len = flen - audio_off;
